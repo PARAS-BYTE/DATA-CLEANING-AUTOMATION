@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+
+# Streamlit Local Cache & Secrets
+.streamlit/secrets.toml
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# Temporary Data Files Generated at Runtime
+uploaded_raw_data.csv
+cleaned_output.csv

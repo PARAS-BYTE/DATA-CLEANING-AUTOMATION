@@ -1,0 +1,17 @@
+Customer_ID,Full_Name,Age,Annual_Income,Signup_Date,Account_Type,Credit_Score,System_Region
+CUST-001,  John Doe ,28.0,"$55,000",2022-01-15,Premium,720.0,GLOBAL
+CUST-002,Jane Smith,,"$68,500",15/02/2022,standard,680.0,GLOBAL
+CUST-003,Robert Brown,45.0,"$48,000",2022-03-10,PREMIUM,,GLOBAL
+CUST-004,Emily Davis,32.0,"$120,000","April 5, 2022",Standard,790.0,GLOBAL
+CUST-005,Michael Wilson,,"$75,200",2022-05-20,VIP,640.0,GLOBAL
+CUST-006,Sarah Taylor,54.0,"$92,000",2022-06-18,Standard,810.0,GLOBAL
+CUST-007,David Clark,23.0,"$41,000",07/19/2022,standard,590.0,GLOBAL
+CUST-008,Jessica White,39.0,"$83,400",2022-08-25,VIP,750.0,GLOBAL
+CUST-009,James Harris,41.0,"$61,000","Sept 12, 2022",Premium,705.0,GLOBAL
+CUST-010,Laura Martin,,"$115,000",2022-10-01,Standard,,GLOBAL
+CUST-003,Robert Brown,45.0,"$48,000",2022-03-10,PREMIUM,,GLOBAL
+CUST-011,Daniel Lewis,31.0,"$52,000",2022-11-14,standard,695.0,GLOBAL
+CUST-012,Ashley Robinson,29.0,"$71,500",12/05/2022,VIP,730.0,GLOBAL
+CUST-013,Matthew Walker,62.0,"$98,000",2023-01-08,Premium,805.0,GLOBAL
+CUST-014,Amanda Hall,35.0,"$64,200",2023-02-14,Standard,660.0,GLOBAL
+CUST-015,Joshua Allen,48.0,"$88,000",2023-03-22,standard,740.0,GLOBAL
