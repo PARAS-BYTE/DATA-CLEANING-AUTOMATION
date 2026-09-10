@@ -261,10 +261,11 @@ with st.sidebar:
         "LLM Model",
         [
             "openai/gpt-oss-120b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-70b-versatile",
-            "llama-3.1-8b-instant",
-            "mixtral-8x7b-32768",
+            "meta-llama/llama-prompt-guard-2-22m",
+            "meta-llama/llama-prompt-guard-2-86m",
+            "qwen/qwen3.6-27b",
+            "qwen/qwen3.8-27b",
+
         ],
         index=0,
         help="Select the model to run Understanding, Cleaning, and Validation agents.",
