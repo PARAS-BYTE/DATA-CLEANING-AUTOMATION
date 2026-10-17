@@ -1,934 +1,610 @@
-import os
+"""
+AI CSV Cleaner: Streamlit + LangGraph + Groq
+
+Install:
+    pip install -U streamlit pandas numpy langchain-core langchain-groq langgraph
+
+Run:
+    streamlit run app.py
+
+The Groq API key is entered in the Streamlit sidebar (never stored in code).
+
+Workflow (LangGraph):
+    understand -> (clean needed?) -> clean -> execute -> validate -> finish
+                                       ^         |          |
+                                       +---------+----------+   (retry loop)
+"""
+
+import re
+import subprocess
 import sys
+import tempfile
 import time
-import json
 from pathlib import Path
-import pandas as pd
+from typing import TypedDict
+
 import numpy as np
+import pandas as pd
 import streamlit as st
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_groq import ChatGroq
+from langgraph.graph import END, START, StateGraph
 
-# Import the core multi-agent engine
-from cleaning_engine import (
-    stream_data_cleaning,
-    DEFAULT_GROQ_API_KEY,
-    DEFAULT_MODEL,
-    summarize_csv,
-)
-from sample_data import generate_sample_dirty_dataset
+# ----------------------------------------------------------------------------
+# 1. CONFIG
+# ----------------------------------------------------------------------------
+SCRIPT_TIMEOUT_SEC = 120
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+MODEL_OPTIONS = [DEFAULT_MODEL, "llama-3.3-70b-versatile", "openai/gpt-oss-20b"]
 
-# ============================================================
-# PAGE CONFIGURATION & METADATA
-# ============================================================
-st.set_page_config(
-    page_title="AutoClean AI | Multi-Agent Data Cleaning",
-    page_icon="✨",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+AGENTS = {
+    "understand": {
+        "icon": "🔍",
+        "name": "Understanding Agent",
+        "role": "Reads the dataset profile and decides whether cleaning is needed, "
+                "listing every issue it finds.",
+    },
+    "clean": {
+        "icon": "🧹",
+        "name": "Cleaning Agent",
+        "role": "Writes a pandas script that fixes only the issues that were found, "
+                "while preserving valid data.",
+    },
+    "execute": {
+        "icon": "⚙️",
+        "name": "Execution Engine",
+        "role": "Runs the generated script in an isolated process with a timeout "
+                "and profiles the output (not an LLM).",
+    },
+    "validate": {
+        "icon": "✅",
+        "name": "Validation Agent",
+        "role": "Audits the cleaned data against the original, checks for "
+                "remaining issues and for accidental data loss.",
+    },
+}
 
-# ============================================================
-# CUSTOM STYLING & ANIMATIONS
-# ============================================================
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+# ----------------------------------------------------------------------------
+# 2. PROMPTS
+# ----------------------------------------------------------------------------
+UNDERSTANDING_PROMPT = """You are a senior data analyst reviewing a raw CSV dataset profile.
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+Your job: decide whether the data needs cleaning and list concrete issues.
+
+Check each of these and only report what the profile actually shows:
+1. Missing values (per column, and whether the missing rate is meaningful)
+2. Duplicate rows
+3. Wrong data types (numbers/dates stored as text, IDs stored as numbers, etc.)
+4. Dirty text: leading/trailing spaces, inconsistent casing, spelling variants of the
+   same category, placeholder strings such as "N/A", "null", "-", "?", "unknown"
+5. Numeric or date values stored with symbols or mixed formats (currency, %, commas)
+6. Impossible values (negative age, future birth dates, etc.).
+   Statistical outliers are NOT errors unless they are clearly impossible.
+
+Rules:
+- Base every claim on evidence in the profile. Do not invent issues.
+- Never recommend deleting rows or categories without clear evidence they are invalid.
+- Do not write code.
+
+Respond in exactly this format:
+CLEANING_REQUIRED: YES or NO
+SUMMARY: one or two sentences
+ISSUES:
+- <column or "dataset">: <issue> -> <recommended fix>
+(write "- none" if no issues)
+"""
+
+CLEANING_PROMPT = """You are a careful pandas data engineer. Write ONE complete Python script.
+
+Predefined variables (already defined above your code, do NOT redefine them):
+- INPUT_PATH: path of the original CSV
+- OUTPUT_PATH: where the cleaned CSV must be saved
+- ENCODING: encoding to use when reading the CSV
+Already imported: pandas as pd, numpy as np, re. You may import other standard libraries.
+
+Requirements:
+1. Load with: df = pd.read_csv(INPUT_PATH, encoding=ENCODING)
+2. Fix ONLY the issues listed in the analysis and the feedback. Do not make extra changes.
+3. Preserve valid rows, columns, categories and values.
+   Do not drop rare categories or statistical outliers without proof they are invalid.
+   Do not rename columns unless the analysis says names are broken.
+4. Be safe: use errors="coerce" for numeric/date conversion and then check that you
+   did not turn many valid values into NaN. Do not blindly fill missing values; only
+   impute when it is clearly justified (e.g. median for a numeric column with few gaps).
+5. Add a short comment before each step.
+6. After each step, print one line describing what changed (e.g. print("Removed 12 duplicate rows")).
+7. Finish with: df.to_csv(OUTPUT_PATH, index=False)
+8. If feedback from a previous attempt is provided, fix exactly those problems.
+
+Output ONLY Python code inside a single ```python fenced block. No explanation.
+"""
+
+VALIDATION_PROMPT = """You are a strict data-quality auditor.
+
+You receive: the original profile, the cleaned profile, programmatic comparison stats,
+the initial analysis, the execution log, and the cleaning history.
+
+Decide:
+- Were the issues from the initial analysis actually fixed?
+- Is any important issue still present in the cleaned profile?
+- Was valid data lost (too many rows dropped, columns removed, categories merged wrongly,
+  numeric values turned into NaN)?
+
+Rules:
+- Do not require valid statistical outliers to be removed.
+- Do not fail for cosmetic reasons. FAIL only for real remaining problems or data loss.
+- Use BLOCKED only when continuing automatically would be unsafe.
+
+Respond in exactly this format:
+VALIDATION_STATUS: PASS or FAIL or BLOCKED
+REASON: one or two sentences
+REMAINING_ISSUES:
+- <issue and the exact fix needed>
+(write "- none" if PASS)
+"""
+
+
+# ----------------------------------------------------------------------------
+# 3. DATA HELPERS
+# ----------------------------------------------------------------------------
+def read_csv_safe(path_or_buffer):
+    """Read CSV trying common encodings. Returns (dataframe, encoding)."""
+    last_error = None
+    for enc in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            if hasattr(path_or_buffer, "seek"):
+                path_or_buffer.seek(0)
+            return pd.read_csv(path_or_buffer, encoding=enc), enc
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    raise ValueError(f"Could not read the CSV: {last_error}")
+
+
+def column_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Per-column table shown to the user and used in the profile."""
+    rows = []
+    for col in df.columns:
+        s = df[col]
+        examples = s.dropna().astype(str).unique()[:3]
+        rows.append({
+            "column": col,
+            "dtype": str(s.dtype),
+            "missing": int(s.isna().sum()),
+            "missing %": round(s.isna().mean() * 100, 1),
+            "unique": int(s.nunique(dropna=True)),
+            "examples": ", ".join(examples),
+        })
+    return pd.DataFrame(rows)
+
+
+def dataset_stats(df: pd.DataFrame) -> dict:
+    return {
+        "rows": len(df),
+        "columns": len(df.columns),
+        "missing_cells": int(df.isna().sum().sum()),
+        "duplicate_rows": int(df.duplicated().sum()),
     }
 
-    /* Hero Banner */
-    .hero-container {
-        background: linear-gradient(135deg, rgba(20, 24, 40, 0.95) 0%, rgba(30, 15, 45, 0.95) 100%);
-        border: 1px solid rgba(255, 255, 255, 0.1);
-        border-radius: 16px;
-        padding: 28px 36px;
-        margin-bottom: 24px;
-        box-shadow: 0 12px 36px rgba(0, 0, 0, 0.35);
-        backdrop-filter: blur(12px);
-    }
-    .hero-badge {
-        display: inline-block;
-        background: linear-gradient(90deg, #00f2fe 0%, #4facfe 100%);
-        color: #0b111e;
-        font-weight: 700;
-        font-size: 0.78rem;
-        text-transform: uppercase;
-        letter-spacing: 1.2px;
-        padding: 4px 12px;
-        border-radius: 20px;
-        margin-bottom: 12px;
-    }
-    .hero-title {
-        font-size: 2.2rem;
-        font-weight: 800;
-        letter-spacing: -0.5px;
-        background: linear-gradient(90deg, #ffffff 30%, #a5b4fc 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin: 0 0 8px 0;
-    }
-    .hero-subtitle {
-        color: #94a3b8;
-        font-size: 1rem;
-        max-width: 800px;
-        line-height: 1.5;
-        margin: 0;
-    }
 
-    /* Animated Stepper Pipeline */
-    .pipeline-wrapper {
-        background: rgba(15, 23, 42, 0.75);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 14px;
-        padding: 16px 20px;
-        margin-bottom: 24px;
-    }
-    .pipeline-title {
-        font-size: 0.85rem;
-        text-transform: uppercase;
-        letter-spacing: 1.5px;
-        color: #64748b;
-        font-weight: 700;
-        margin-bottom: 14px;
-    }
-    .pipeline-steps {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-    }
-    .step-card {
-        flex: 1;
-        min-width: 140px;
-        padding: 12px 14px;
-        border-radius: 10px;
-        background: rgba(30, 41, 59, 0.5);
-        border: 1px solid rgba(255, 255, 255, 0.06);
-        text-align: center;
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        position: relative;
-    }
-    .step-card.active {
-        background: linear-gradient(135deg, rgba(79, 70, 229, 0.25) 0%, rgba(147, 51, 234, 0.25) 100%);
-        border: 1.5px solid #818cf8;
-        box-shadow: 0 0 20px rgba(129, 140, 248, 0.4);
-        transform: translateY(-2px);
-        animation: pulseBorder 2s infinite;
-    }
-    .step-card.done {
-        background: rgba(16, 185, 129, 0.12);
-        border: 1px solid #10b981;
-    }
-    .step-card.failed {
-        background: rgba(239, 68, 68, 0.15);
-        border: 1px solid #ef4444;
-    }
-    .step-icon {
-        font-size: 1.3rem;
-        margin-bottom: 4px;
-        display: block;
-    }
-    .step-name {
-        font-size: 0.8rem;
-        font-weight: 600;
-        color: #e2e8f0;
-    }
-    .step-status {
-        font-size: 0.7rem;
-        color: #94a3b8;
-        margin-top: 2px;
-    }
-
-    @keyframes pulseBorder {
-        0% { box-shadow: 0 0 10px rgba(129, 140, 248, 0.3); }
-        50% { box-shadow: 0 0 24px rgba(129, 140, 248, 0.7); }
-        100% { box-shadow: 0 0 10px rgba(129, 140, 248, 0.3); }
-    }
-
-    /* Agent Output Card */
-    .agent-card {
-        background: #111827;
-        border: 1px solid #1f2937;
-        border-radius: 12px;
-        padding: 20px;
-        margin-bottom: 16px;
-        transition: transform 0.2s ease;
-    }
-    .agent-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 12px;
-        border-bottom: 1px solid #1f2937;
-        padding-bottom: 10px;
-    }
-    .agent-title {
-        font-weight: 700;
-        font-size: 1.05rem;
-        display: flex;
-        align-items: center;
-        gap: 8px;
-    }
-    .agent-badge {
-        font-size: 0.75rem;
-        font-weight: 700;
-        padding: 3px 10px;
-        border-radius: 12px;
-        letter-spacing: 0.5px;
-    }
-    .badge-pass { background: #064e3b; color: #34d399; border: 1px solid #059669; }
-    .badge-fail { background: #7f1d1d; color: #f87171; border: 1px solid #dc2626; }
-    .badge-blocked { background: #78350f; color: #fbbf24; border: 1px solid #d97706; }
-    .badge-working { background: #1e1b4b; color: #a5b4fc; border: 1px solid #6366f1; }
-
-    /* Metric Cards */
-    .metric-box {
-        background: rgba(30, 41, 59, 0.4);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 12px;
-        padding: 16px 20px;
-        text-align: center;
-    }
-    .metric-val {
-        font-size: 1.8rem;
-        font-weight: 800;
-        color: #f8fafc;
-    }
-    .metric-lbl {
-        font-size: 0.78rem;
-        color: #94a3b8;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        margin-top: 4px;
-    }
-    .metric-delta {
-        font-size: 0.8rem;
-        font-weight: 600;
-        margin-top: 4px;
-    }
-    .delta-positive { color: #10b981; }
-    .delta-negative { color: #ef4444; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ============================================================
-# INITIALIZE SESSION STATE
-# ============================================================
-if "cleaned_output_path" not in st.session_state:
-    st.session_state.cleaned_output_path = None
-if "current_dataset_path" not in st.session_state:
-    st.session_state.current_dataset_path = None
-if "execution_log" not in st.session_state:
-    st.session_state.execution_log = []
-if "is_running" not in st.session_state:
-    st.session_state.is_running = False
-if "active_node" not in st.session_state:
-    st.session_state.active_node = None
-if "completed_nodes" not in st.session_state:
-    st.session_state.completed_nodes = set()
-if "node_outputs" not in st.session_state:
-    st.session_state.node_outputs = {}
-if "workflow_finished" not in st.session_state:
-    st.session_state.workflow_finished = False
-
-# ============================================================
-# SIDEBAR CONFIGURATION
-# ============================================================
-with st.sidebar:
-    st.markdown("### ⚙️ Autonomous Multi-Agent Config")
-
-    initial_key = ""
-    if hasattr(st, "secrets") and "GROQ_API_KEY" in st.secrets:
-        initial_key = st.secrets["GROQ_API_KEY"]
-    elif "GROQ_API_KEY" in os.environ:
-        initial_key = os.environ["GROQ_API_KEY"]
-    else:
-        initial_key = DEFAULT_GROQ_API_KEY
-
-    api_key_input = st.text_input(
-        "Groq API Key",
-        value=initial_key,
-        type="password",
-        help="Groq API key used by ChatGroq to power the agents.",
-    )
-
-    model_choice = st.selectbox(
-        "LLM Model",
-        [
-            "openai/gpt-oss-120b",
-            "meta-llama/llama-prompt-guard-2-22m",
-            "meta-llama/llama-prompt-guard-2-86m",
-            "qwen/qwen3.6-27b",
-            "qwen/qwen3.8-27b",
-
-        ],
-        index=0,
-        help="Select the model to run Understanding, Cleaning, and Validation agents.",
-    )
-
-    recursion_limit = st.slider(
-        "Max Iterations Safety Cap",
-        min_value=50,
-        max_value=500,
-        value=200,
-        step=50,
-        help="LangGraph recursion limit to prevent infinite loops.",
-    )
-
-    st.markdown("---")
-    st.markdown("### 📋 Multi-Agent Architecture")
-    st.caption(
-        """
-        1. **Dataset Profiler**: Deep statistical & structural scan
-        2. **Understanding Agent**: Analyzes flaws & decides cleaning need
-        3. **Cleaning Agent**: Crafts executable Pandas script
-        4. **Code Execution Engine**: Safely runs script locally
-        5. **Validation Auditor**: Checks data integrity & categorical drift
-        6. **Autonomous Loop**: Auto-corrects if validation fails!
-        """
-    )
-
-    if st.button("🔄 Reset App State", use_container_width=True):
-        st.session_state.cleaned_output_path = None
-        st.session_state.execution_log = []
-        st.session_state.active_node = None
-        st.session_state.completed_nodes = set()
-        st.session_state.node_outputs = {}
-        st.session_state.workflow_finished = False
-        st.session_state.is_running = False
-        st.rerun()
-
-# ============================================================
-# HERO BANNER
-# ============================================================
-st.markdown(
-    """
-    <div class="hero-container">
-        <span class="hero-badge">AI Autonomous Multi-Agent System</span>
-        <h1 class="hero-title">Intelligent Data Cleaning Pipeline</h1>
-        <p class="hero-subtitle">
-            Experience real-time multi-agent orchestration. Observe LLM agents reason, generate Python code,
-            execute transformations, and rigorously audit data integrity with automatic feedback loops.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-# ============================================================
-# DATASET INGESTION SECTION
-# ============================================================
-st.subheader("📂 1. Select or Upload Dataset")
-
-col_upload, col_sample = st.columns([3, 2])
-
-with col_upload:
-    uploaded_file = st.file_uploader(
-        "Upload any CSV dataset to clean",
-        type=["csv"],
-        help="Upload your raw or messy CSV file to start the multi-agent cleaning process.",
-    )
-
-with col_sample:
-    st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-    if st.button("⚡ Generate & Load Demo Messy Dataset", use_container_width=True):
-        sample_path = generate_sample_dirty_dataset("sample_dirty_data.csv")
-        st.session_state.current_dataset_path = sample_path
-        st.session_state.cleaned_output_path = None
-        st.session_state.execution_log = []
-        st.session_state.active_node = None
-        st.session_state.completed_nodes = set()
-        st.session_state.node_outputs = {}
-        st.session_state.workflow_finished = False
-        st.success("Loaded demo messy customer dataset with missing values, messy formats, and duplicates!")
-
-# Handle uploaded file
-if uploaded_file is not None:
-    temp_path = Path("uploaded_raw_data.csv")
-    with open(temp_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.session_state.current_dataset_path = str(temp_path.resolve())
-
-# Verify dataset availability
-raw_csv_path = st.session_state.get("current_dataset_path")
-
-if not raw_csv_path or not Path(raw_csv_path).exists():
-    st.info("👆 Please upload a CSV file or click 'Generate & Load Demo Messy Dataset' above to proceed.")
-    st.stop()
-
-# Load raw dataset for exploration
-raw_df = pd.read_csv(raw_csv_path)
-
-# ============================================================
-# BEFORE CSV INSPECTION
-# ============================================================
-st.markdown("---")
-st.subheader("📊 Raw Dataset Overview (Before Cleaning)")
-
-c1, c2, c3, c4 = st.columns(4)
-raw_rows, raw_cols = raw_df.shape
-raw_missing = int(raw_df.isna().sum().sum())
-raw_duplicates = int(raw_df.duplicated().sum())
-
-with c1:
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-val">{raw_rows:,}</div>
-            <div class="metric-lbl">Total Rows</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c2:
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-val">{raw_cols}</div>
-            <div class="metric-lbl">Total Columns</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c3:
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-val" style="color: {'#ef4444' if raw_missing > 0 else '#10b981'};">{raw_missing:,}</div>
-            <div class="metric-lbl">Missing Values</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-with c4:
-    st.markdown(
-        f"""
-        <div class="metric-box">
-            <div class="metric-val" style="color: {'#f59e0b' if raw_duplicates > 0 else '#10b981'};">{raw_duplicates:,}</div>
-            <div class="metric-lbl">Duplicate Rows</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-with st.expander("🔍 Preview Raw Dataset & Column Data Types", expanded=True):
-    st.dataframe(raw_df, use_container_width=True, height=220)
-    col_info = pd.DataFrame(
-        {
-            "Data Type": raw_df.dtypes.astype(str),
-            "Missing Count": raw_df.isna().sum(),
-            "Missing %": (raw_df.isna().sum() / len(raw_df) * 100).round(2),
-            "Unique Values": raw_df.nunique(),
-        }
-    )
-    st.caption("Column Integrity Breakdown:")
-    st.dataframe(col_info.T, use_container_width=True)
-
-# ============================================================
-# PIPELINE STEPPER FUNCTION
-# ============================================================
-pipeline_steps_def = [
-    {"id": "profile_original", "name": "Dataset Profiler", "icon": "📊"},
-    {"id": "understanding_agent", "name": "Understanding Agent", "icon": "🧠"},
-    {"id": "cleaning_agent", "name": "Cleaning Agent", "icon": "💻"},
-    {"id": "execute_cleaning", "name": "Code Execution", "icon": "⚙️"},
-    {"id": "validation_agent", "name": "Validation Auditor", "icon": "🛡️"},
-    {"id": "finalize", "name": "Finalizer", "icon": "🏁"},
-]
-
-def render_pipeline_stepper(active_node: str, completed_nodes: set):
-    steps_html = []
-    for step in pipeline_steps_def:
-        s_id = step["id"]
-        is_active = (s_id == active_node)
-        is_done = (s_id in completed_nodes)
-
-        card_class = "step-card"
-        status_text = "Pending"
-        if is_active:
-            card_class += " active"
-            status_text = "⚡ In Progress..."
-        elif is_done:
-            card_class += " done"
-            status_text = "✓ Completed"
-
-        steps_html.append(
-            f"""
-            <div class="{card_class}">
-                <span class="step-icon">{step['icon']}</span>
-                <div class="step-name">{step['name']}</div>
-                <div class="step-status">{status_text}</div>
-            </div>
-            """
+def profile_dataframe(df: pd.DataFrame) -> str:
+    """Compact text profile that the agents read."""
+    stats = dataset_stats(df)
+    lines = [
+        f"Rows: {stats['rows']} | Columns: {stats['columns']} | "
+        f"Missing cells: {stats['missing_cells']} | Duplicate rows: {stats['duplicate_rows']}",
+        "",
+        "COLUMNS (name | dtype | missing | unique | examples)",
+    ]
+    for _, r in column_summary(df).iterrows():
+        lines.append(
+            f"- {r['column']} | {r['dtype']} | {r['missing']} ({r['missing %']}%) | "
+            f"{r['unique']} | {r['examples']}"
         )
 
-    full_html = f"""
-    <div class="pipeline-wrapper">
-        <div class="pipeline-title">🚀 Autonomous Multi-Agent Execution Pipeline</div>
-        <div class="pipeline-steps">
-            {''.join(steps_html)}
-        </div>
-    </div>
-    """
-    return full_html
+    text_cols = df.select_dtypes(include=["object", "string"]).columns[:25]
+    if len(text_cols):
+        lines += ["", "TOP VALUES OF TEXT COLUMNS (value: count)"]
+        for col in text_cols:
+            top = df[col].value_counts(dropna=True).head(6)
+            lines.append(f"- {col}: " + "; ".join(f"{k!r}: {v}" for k, v in top.items()))
+            blanks = int((df[col].astype(str).str.strip() != df[col].astype(str)).sum())
+            if blanks:
+                lines.append(f"  (has {blanks} values with leading/trailing spaces)")
 
-# Placeholder for the animated stepper
-stepper_placeholder = st.empty()
-stepper_placeholder.markdown(
-    render_pipeline_stepper(st.session_state.active_node, st.session_state.completed_nodes),
-    unsafe_allow_html=True,
-)
+    numeric = df.select_dtypes(include=np.number)
+    if not numeric.empty:
+        lines += ["", "NUMERIC SUMMARY", numeric.describe().round(3).T.to_string()]
 
-# ============================================================
-# RUN WORKFLOW TRIGGER
-# ============================================================
-st.markdown("---")
-col_btn, col_info_btn = st.columns([2, 3])
+    lines += ["", "SAMPLE ROWS", df.head(5).to_string(index=False)]
+    return "\n".join(lines)[:18000]
 
-with col_btn:
-    start_cleaning = st.button(
-        "🚀 Start Autonomous Multi-Agent Cleaning",
-        type="primary",
-        disabled=st.session_state.is_running,
-        use_container_width=True,
+
+def compare_stats(before: dict, after: dict, cols_before, cols_after) -> str:
+    removed = sorted(set(cols_before) - set(cols_after))
+    added = sorted(set(cols_after) - set(cols_before))
+    return (
+        f"Rows: {before['rows']} -> {after['rows']}\n"
+        f"Columns: {before['columns']} -> {after['columns']}\n"
+        f"Missing cells: {before['missing_cells']} -> {after['missing_cells']}\n"
+        f"Duplicate rows: {before['duplicate_rows']} -> {after['duplicate_rows']}\n"
+        f"Columns removed: {removed or 'none'}\n"
+        f"Columns added: {added or 'none'}"
     )
 
-with col_info_btn:
-    if st.session_state.workflow_finished:
-        st.success("🎉 Workflow successfully completed! Review the step-by-step audit and cleaned dataset below.")
-    else:
-        st.info("💡 Clicking the button initiates the autonomous LangGraph loop with real-time agent visualization.")
 
-# Containers for live outputs
-live_status_placeholder = st.empty()
-agent_logs_container = st.container()
+# ----------------------------------------------------------------------------
+# 4. LLM HELPERS
+# ----------------------------------------------------------------------------
+def make_llm(api_key: str, model: str) -> ChatGroq:
+    return ChatGroq(model=model, temperature=0, api_key=api_key)
 
-# ============================================================
-# STREAMING EXECUTION HANDLER
-# ============================================================
-if start_cleaning:
-    st.session_state.is_running = True
-    st.session_state.workflow_finished = False
-    st.session_state.completed_nodes = set()
-    st.session_state.node_outputs = {}
-    st.session_state.execution_log = []
-    output_clean_path = "cleaned_output.csv"
 
-    # Animated progress bar
-    progress_bar = st.progress(0, text="Initializing LangGraph Multi-Agent Workflow...")
+def ask(llm, system_prompt: str, user_prompt: str) -> str:
+    response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
+    content = response.content
+    if isinstance(content, list):  # some models return content blocks
+        content = "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in content)
+    return content.strip()
 
-    step_progress_weights = {
-        "profile_original": 15,
-        "understanding_agent": 35,
-        "cleaning_agent": 55,
-        "execute_cleaning": 75,
-        "profile_cleaned": 85,
-        "validation_agent": 95,
-        "finalize": 100,
-    }
+
+def parse_field(text: str, field: str, allowed: str):
+    match = re.search(rf"{field}\s*:\s*\**\s*({allowed})", text, re.I)
+    return match.group(1).upper() if match else None
+
+
+def extract_code(text: str) -> str:
+    match = re.search(r"```(?:python)?\s*(.*?)```", text, re.I | re.S)
+    return (match.group(1) if match else text).strip()
+
+
+# ----------------------------------------------------------------------------
+# 5. SCRIPT EXECUTION (subprocess, not exec)
+# ----------------------------------------------------------------------------
+def run_cleaning_script(code: str, work_dir: Path, input_path: Path, output_path: Path, encoding: str, attempt: int):
+    """Run generated code in a separate Python process. Returns (ok, log)."""
+    header = (
+        "import re\nimport numpy as np\nimport pandas as pd\n"
+        f"INPUT_PATH = {str(input_path)!r}\n"
+        f"OUTPUT_PATH = {str(output_path)!r}\n"
+        f"ENCODING = {encoding!r}\n\n"
+    )
+    script_path = (work_dir / f"cleaning_script_attempt_{attempt}.py").resolve()
+    script_path.write_text(header + code, encoding="utf-8")
+    if output_path.exists():
+        output_path.unlink()
 
     try:
-        stream = stream_data_cleaning(
-            csv_path=raw_csv_path,
-            api_key=api_key_input.strip(),
-            model_name=model_choice,
-            output_filename=output_clean_path,
-            recursion_limit=recursion_limit,
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True, text=True, timeout=SCRIPT_TIMEOUT_SEC, cwd=str(work_dir.resolve()),
         )
+    except subprocess.TimeoutExpired:
+        return False, f"Script timed out after {SCRIPT_TIMEOUT_SEC}s."
 
-        for event in stream:
-            node = event["node"]
-            output = event["output"]
-            st.session_state.active_node = node
-            st.session_state.completed_nodes.add(node)
-            st.session_state.node_outputs[node] = output
-            st.session_state.execution_log.append(event)
+    log = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        return False, f"{log}\n\nSTDERR:\n{(proc.stderr or '')[-1500:]}".strip()
+    if not output_path.exists():
+        return False, "Script finished but did not create the output CSV."
+    return True, log
 
-            # Update Stepper with active state animation
-            stepper_placeholder.markdown(
-                render_pipeline_stepper(node, st.session_state.completed_nodes),
-                unsafe_allow_html=True,
-            )
 
-            # Update progress bar
-            pct = step_progress_weights.get(node, 50)
-            progress_bar.progress(pct, text=f"Active Agent: {node.replace('_', ' ').title()}...")
+# ----------------------------------------------------------------------------
+# 6. LANGGRAPH WORKFLOW
+# ----------------------------------------------------------------------------
+class State(TypedDict, total=False):
+    input_path: str
+    encoding: str
+    max_attempts: int
+    original_profile: str
+    original_stats: dict
+    current_profile: str
+    analysis: str
+    code: str
+    exec_log: str
+    comparison: str
+    feedback: str
+    validation: str
+    history: list
+    iteration: int
+    work_dir: str
+    cleaned_df: pd.DataFrame
+    status: str
+    final_message: str
 
-            # Small pause to allow visual animation transition
-            time.sleep(0.3)
 
-        progress_bar.progress(100, text="All agents have finished execution!")
-        time.sleep(0.5)
-        progress_bar.empty()
+def build_graph(llm):
+    def understand(state: State):
+        user = f"Dataset profile:\n\n{state['original_profile']}"
+        answer = ask(llm, UNDERSTANDING_PROMPT, user)
+        decision = parse_field(answer, "CLEANING_REQUIRED", "YES|NO") or "YES"
+        return {"analysis": answer, "status": "CLEAN" if decision == "NO" else "NEEDS_CLEANING"}
 
-        st.session_state.active_node = "finalize"
-        st.session_state.completed_nodes.add("finalize")
-        stepper_placeholder.markdown(
-            render_pipeline_stepper(None, st.session_state.completed_nodes),
-            unsafe_allow_html=True,
+    def route_understand(state: State):
+        return "finish" if state["status"] == "CLEAN" else "clean"
+
+    def clean(state: State):
+        user = (
+            f"INITIAL ANALYSIS:\n{state['analysis']}\n\n"
+            f"ORIGINAL DATASET PROFILE:\n{state['original_profile']}\n\n"
+            f"CLEANING HISTORY:\n{chr(10).join(state.get('history', [])) or 'First attempt.'}\n\n"
+            f"FEEDBACK FROM PREVIOUS ATTEMPT (fix these):\n{state.get('feedback') or 'None'}\n\n"
+            "Write the full cleaning script now."
         )
+        return {"code": extract_code(ask(llm, CLEANING_PROMPT, user))}
 
-        st.session_state.cleaned_output_path = output_clean_path
-        st.session_state.workflow_finished = True
-        st.session_state.is_running = False
-        st.balloons()
-        st.rerun()
+    def execute(state: State):
+        attempt = state.get("iteration", 0) + 1
+        work_dir = Path(state["work_dir"])
+        output_path = (work_dir / f"cleaned_attempt_{attempt}.csv").resolve()
+        ok, log = run_cleaning_script(
+            state["code"], work_dir, Path(state["input_path"]).resolve(), output_path, state["encoding"], attempt
+        )
+        history = state.get("history", [])
 
-    except Exception as exc:
-        st.session_state.is_running = False
-        st.error(f"❌ Execution encountered an error: {str(exc)}")
-        progress_bar.empty()
+        if ok:
+            try:
+                cleaned = pd.read_csv(output_path)
+                if cleaned.empty:
+                    raise ValueError("The cleaned CSV is empty.")
+            except Exception as exc:  # noqa: BLE001
+                ok, log = False, f"{log}\nOutput problem: {exc}"
 
-# ============================================================
-# AGENT STEP OUTPUT INSPECTOR
-# ============================================================
-if st.session_state.node_outputs:
-    st.markdown("---")
-    st.subheader("🕵️ Step-by-Step Agent Outputs & Reasoning")
+        if not ok:
+            return {
+                "iteration": attempt,
+                "exec_log": log,
+                "feedback": f"Execution failed:\n{log}",
+                "history": history + [f"Attempt {attempt}: FAILED"],
+                "status": "RETRY" if attempt < state["max_attempts"] else "BLOCKED",
+            }
 
-    tabs = st.tabs(
-        [
-            "1. 📊 Profiler",
-            "2. 🧠 Understanding Agent",
-            "3. 💻 Cleaning Agent",
-            "4. ⚙️ Execution Engine",
-            "5. 🛡️ Validation Auditor",
-            "6. 🏁 Final Summary",
-        ]
-    )
+        original_df, _ = read_csv_safe(state["input_path"])
+        comparison = compare_stats(
+            state["original_stats"], dataset_stats(cleaned), original_df.columns, cleaned.columns
+        )
+        return {
+            "iteration": attempt,
+            "exec_log": log or "(script printed nothing)",
+            "cleaned_df": cleaned,
+            "current_profile": profile_dataframe(cleaned),
+            "comparison": comparison,
+            "history": history + [f"Attempt {attempt}: script ran OK, shape={cleaned.shape}"],
+            "status": "VALIDATE",
+        }
 
-    # Tab 1: Profiler
-    with tabs[0]:
-        if "profile_original" in st.session_state.node_outputs:
-            summary = st.session_state.node_outputs["profile_original"].get("original_summary", "")
-            st.markdown(
-                """
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">📊 Dataset Profiler Output</span>
-                        <span class="agent-badge badge-pass">STRUCTURE DETECTED</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            with st.expander("View Full Context-Budgeted Profile", expanded=True):
-                st.text(summary)
+    def route_execute(state: State):
+        return {"VALIDATE": "validate", "RETRY": "clean"}.get(state["status"], "finish")
+
+    def validate(state: State):
+        user = (
+            f"ORIGINAL PROFILE:\n{state['original_profile']}\n\n"
+            f"CLEANED PROFILE:\n{state['current_profile']}\n\n"
+            f"COMPARISON:\n{state['comparison']}\n\n"
+            f"INITIAL ANALYSIS:\n{state['analysis']}\n\n"
+            f"EXECUTION LOG:\n{state['exec_log']}\n\n"
+            f"HISTORY:\n{chr(10).join(state.get('history', []))}\n\n"
+            "Audit the cleaned dataset."
+        )
+        answer = ask(llm, VALIDATION_PROMPT, user)
+        verdict = parse_field(answer, "VALIDATION_STATUS", "PASS|FAIL|BLOCKED") or "FAIL"
+        status = {"PASS": "PASS", "BLOCKED": "BLOCKED"}.get(verdict, "RETRY")
+        return {"validation": answer, "feedback": answer, "status": status}
+
+    def route_validate(state: State):
+        if state["status"] in ("PASS", "BLOCKED"):
+            return "finish"
+        return "finish" if state["iteration"] >= state["max_attempts"] else "clean"
+
+    def finish(state: State):
+        status = state["status"]
+        if status == "CLEAN":
+            msg = "✅ No cleaning was required. Your data already looks good."
+        elif status == "PASS":
+            msg = f"✅ Cleaning finished and passed validation in {state['iteration']} attempt(s)."
+        elif status == "RETRY":
+            msg = "⚠️ Maximum attempts reached. The latest output is shown, but validation still lists issues."
         else:
-            st.info("Profiler step has not run yet.")
+            msg = "🛑 The workflow was blocked. Review the reports below before using any output."
+        return {"final_message": msg}
 
-    # Tab 2: Understanding Agent
-    with tabs[1]:
-        if "understanding_agent" in st.session_state.node_outputs:
-            u_out = st.session_state.node_outputs["understanding_agent"]
-            u_report = u_out.get("understanding_report", "")
-            cleaning_req = u_out.get("cleaning_required", True)
+    g = StateGraph(State)
+    g.add_node("understand", understand)
+    g.add_node("clean", clean)
+    g.add_node("execute", execute)
+    g.add_node("validate", validate)
+    g.add_node("finish", finish)
+    g.add_edge(START, "understand")
+    g.add_conditional_edges("understand", route_understand, {"clean": "clean", "finish": "finish"})
+    g.add_edge("clean", "execute")
+    g.add_conditional_edges("execute", route_execute, {"validate": "validate", "clean": "clean", "finish": "finish"})
+    g.add_conditional_edges("validate", route_validate, {"clean": "clean", "finish": "finish"})
+    g.add_edge("finish", END)
+    return g.compile()
 
-            status_badge = (
-                '<span class="agent-badge badge-fail">CLEANING REQUIRED: YES</span>'
-                if cleaning_req
-                else '<span class="agent-badge badge-pass">CLEANING REQUIRED: NO</span>'
-            )
 
-            st.markdown(
-                f"""
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">🧠 Understanding Agent Diagnosis</span>
-                        {status_badge}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown(u_report)
+# ----------------------------------------------------------------------------
+# 7. UI HELPERS
+# ----------------------------------------------------------------------------
+def render_agent_event(node: str, update: dict, elapsed: float | None = None):
+    """Show what one agent did, as an expandable card."""
+    if node == "finish":
+        return
+    meta = AGENTS[node]
+    failed = node == "execute" and update.get("status") in ("RETRY", "BLOCKED")
+    attempt = update.get("iteration")
+    title = f"{meta['icon']} {meta['name']}"
+    if attempt and node in ("execute",):
+        title += f" (attempt {attempt})"
+    if elapsed is not None:
+        title += f" · {elapsed:.1f}s"
+
+    with st.status(title, state="error" if failed else "complete", expanded=False):
+        st.caption(meta["role"])
+        if node == "understand":
+            st.text(update["analysis"])
+        elif node == "clean":
+            st.code(update["code"], language="python")
+        elif node == "execute":
+            st.markdown("**Execution log**")
+            st.text(update.get("exec_log", ""))
+            if update.get("comparison"):
+                st.markdown("**Before → after**")
+                st.text(update["comparison"])
+        elif node == "validate":
+            st.text(update["validation"])
+
+
+def render_agent_roster():
+    with st.expander("🤖 Meet the agents"):
+        for meta in AGENTS.values():
+            st.markdown(f"**{meta['icon']} {meta['name']}**: {meta['role']}")
+
+
+def render_upload_overview(df: pd.DataFrame):
+    """Everything the user can learn about the data right after uploading."""
+    stats = dataset_stats(df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Rows", f"{stats['rows']:,}")
+    c2.metric("Columns", stats["columns"])
+    c3.metric("Missing cells", f"{stats['missing_cells']:,}")
+    c4.metric("Duplicate rows", f"{stats['duplicate_rows']:,}")
+
+    tab_preview, tab_cols, tab_stats = st.tabs(["Preview", "Column info", "Numeric summary"])
+    with tab_preview:
+        st.dataframe(df.head(20))
+    with tab_cols:
+        st.dataframe(column_summary(df), hide_index=True)
+    with tab_stats:
+        numeric = df.select_dtypes(include=np.number)
+        if numeric.empty:
+            st.info("No numeric columns found.")
         else:
-            st.info("Understanding Agent has not run yet.")
+            st.dataframe(numeric.describe().round(3).T)
 
-    # Tab 3: Cleaning Agent
-    with tabs[2]:
-        if "cleaning_agent" in st.session_state.node_outputs:
-            c_out = st.session_state.node_outputs["cleaning_agent"]
-            code = c_out.get("cleaning_code", "")
 
-            st.markdown(
-                """
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">💻 Cleaning Agent Generated Python Script</span>
-                        <span class="agent-badge badge-working">PANDAS CODE READY</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.code(code, language="python")
-            st.download_button(
-                "📥 Download Cleaning Python Script",
-                data=code,
-                file_name="cleaning_script.py",
-                mime="text/x-python",
-            )
-        else:
-            st.info("Cleaning Agent has not run yet.")
+def render_results(result: dict, events: list):
+    st.subheader("Result")
+    status = result.get("status")
+    (st.success if status in ("PASS", "CLEAN") else st.warning)(result.get("final_message", "Finished."))
 
-    # Tab 4: Execution Engine
-    with tabs[3]:
-        if "execute_cleaning" in st.session_state.node_outputs:
-            e_out = st.session_state.node_outputs["execute_cleaning"]
-            success = e_out.get("execution_success", False)
-            error = e_out.get("execution_error", "")
-            history = e_out.get("cleaning_history", [])
+    st.subheader("Agent activity")
+    for node, update, elapsed in events:
+        render_agent_event(node, update, elapsed)
 
-            badge = (
-                '<span class="agent-badge badge-pass">EXECUTION SUCCESS</span>'
-                if success
-                else '<span class="agent-badge badge-fail">EXECUTION FAILED</span>'
-            )
+    cleaned_df = result.get("cleaned_df")
+    if cleaned_df is not None:
+        st.subheader("Cleaned data")
+        before, after = result["original_stats"], dataset_stats(cleaned_df)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Rows", f"{after['rows']:,}", after["rows"] - before["rows"])
+        c2.metric("Columns", after["columns"], after["columns"] - before["columns"])
+        c3.metric("Missing cells", f"{after['missing_cells']:,}", after["missing_cells"] - before["missing_cells"], delta_color="inverse")
+        c4.metric("Duplicate rows", f"{after['duplicate_rows']:,}", after["duplicate_rows"] - before["duplicate_rows"], delta_color="inverse")
 
-            st.markdown(
-                f"""
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">⚙️ Code Execution Results</span>
-                        {badge}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if success:
-                st.success("✅ The Python cleaning script ran with zero exceptions and outputted cleaned_output.csv.")
-            else:
-                st.error(f"Execution Error: {error}")
+        tab_data, tab_cols = st.tabs(["Cleaned data", "Column info"])
+        with tab_data:
+            st.dataframe(cleaned_df)
+        with tab_cols:
+            st.dataframe(column_summary(cleaned_df), hide_index=True)
 
-            if history:
-                st.markdown("**Execution History Trail:**")
-                for item in history:
-                    st.markdown(f"- `{item}`")
-        else:
-            st.info("Code Execution has not run yet.")
-
-    # Tab 5: Validation Auditor
-    with tabs[4]:
-        if "validation_agent" in st.session_state.node_outputs:
-            v_out = st.session_state.node_outputs["validation_agent"]
-            v_report = v_out.get("validation_report", "")
-            passed = v_out.get("validation_passed", False)
-            blocked = v_out.get("blocked", False)
-
-            if passed:
-                v_badge = '<span class="agent-badge badge-pass">VALIDATION: PASS</span>'
-            elif blocked:
-                v_badge = '<span class="agent-badge badge-blocked">VALIDATION: BLOCKED</span>'
-            else:
-                v_badge = '<span class="agent-badge badge-fail">VALIDATION: FAIL (LOOPING BACK)</span>'
-
-            st.markdown(
-                f"""
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">🛡️ Validation Auditor Report</span>
-                        {v_badge}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown(v_report)
-        else:
-            st.info("Validation Auditor has not run yet.")
-
-    # Tab 6: Final Summary
-    with tabs[5]:
-        if "finalize" in st.session_state.node_outputs:
-            f_out = st.session_state.node_outputs["finalize"]
-            messages = f_out.get("messages", [])
-            final_text = messages[-1].content if messages else "Completed."
-            st.markdown(
-                """
-                <div class="agent-card">
-                    <div class="agent-header">
-                        <span class="agent-title">🏁 Workflow Conclusion</span>
-                        <span class="agent-badge badge-pass">FINAL REPORT</span>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            st.markdown(final_text)
-        else:
-            st.info("Final node has not run yet.")
-
-# ============================================================
-# BEFORE VS. AFTER CSV COMPARISON SECTION
-# ============================================================
-cleaned_path = st.session_state.get("cleaned_output_path")
-
-if cleaned_path and Path(cleaned_path).exists():
-    cleaned_df = pd.read_csv(cleaned_path)
-
-    st.markdown("---")
-    st.subheader("✨ 3. Before vs. After Data Comparison")
-
-    clean_rows, clean_cols = cleaned_df.shape
-    clean_missing = int(cleaned_df.isna().sum().sum())
-    clean_duplicates = int(cleaned_df.duplicated().sum())
-
-    # Delta Metrics Row
-    m1, m2, m3, m4 = st.columns(4)
-
-    with m1:
-        row_delta = clean_rows - raw_rows
-        st.markdown(
-            f"""
-            <div class="metric-box">
-                <div class="metric-val">{clean_rows:,}</div>
-                <div class="metric-lbl">Cleaned Rows</div>
-                <div class="metric-delta {'delta-positive' if row_delta <= 0 else 'delta-negative'}">
-                    {'Preserved' if row_delta == 0 else f'{row_delta} rows (removed invalid/duplicates)'}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with m2:
-        col_delta = clean_cols - raw_cols
-        st.markdown(
-            f"""
-            <div class="metric-box">
-                <div class="metric-val">{clean_cols}</div>
-                <div class="metric-lbl">Cleaned Columns</div>
-                <div class="metric-delta {'delta-positive' if col_delta <= 0 else 'delta-negative'}">
-                    {'Same columns' if col_delta == 0 else f'{col_delta} columns adjusted'}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with m3:
-        missing_diff = clean_missing - raw_missing
-        pct_improvement = (
-            ((raw_missing - clean_missing) / raw_missing * 100) if raw_missing > 0 else 100
-        )
-        st.markdown(
-            f"""
-            <div class="metric-box">
-                <div class="metric-val" style="color: {'#10b981' if clean_missing == 0 else '#f59e0b'};">{clean_missing:,}</div>
-                <div class="metric-lbl">Missing Values After</div>
-                <div class="metric-delta delta-positive">
-                    {pct_improvement:.0f}% Missingness Eliminated (Δ {missing_diff})
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    with m4:
-        dup_diff = clean_duplicates - raw_duplicates
-        st.markdown(
-            f"""
-            <div class="metric-box">
-                <div class="metric-val" style="color: {'#10b981' if clean_duplicates == 0 else '#ef4444'};">{clean_duplicates:,}</div>
-                <div class="metric-lbl">Duplicates After</div>
-                <div class="metric-delta delta-positive">
-                    {'Zero Duplicates Left!' if clean_duplicates == 0 else f'Δ {dup_diff}'}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("<div style='height: 16px;'></div>", unsafe_allow_html=True)
-
-    # Side by side dataset tabs
-    tab_before, tab_after, tab_diff = st.tabs(
-        ["🔴 Raw Dataset (Before)", "🟢 Cleaned Dataset (After)", "⚖️ Column Quality Matrix"]
-    )
-
-    with tab_before:
-        st.caption("Original uncleaned data:")
-        st.dataframe(raw_df, use_container_width=True, height=280)
-
-    with tab_after:
-        st.caption("Autonomous multi-agent cleaned dataset:")
-        st.dataframe(cleaned_df, use_container_width=True, height=280)
-
-    with tab_diff:
-        # Build comparative summary
-        all_cols = sorted(list(set(raw_df.columns).union(set(cleaned_df.columns))))
-        matrix_rows = []
-        for col in all_cols:
-            raw_has = col in raw_df.columns
-            clean_has = col in cleaned_df.columns
-
-            raw_dt = str(raw_df[col].dtype) if raw_has else "N/A (Dropped)"
-            clean_dt = str(cleaned_df[col].dtype) if clean_has else "N/A (Dropped)"
-
-            raw_nulls = int(raw_df[col].isna().sum()) if raw_has else 0
-            clean_nulls = int(cleaned_df[col].isna().sum()) if clean_has else 0
-
-            status = "Preserved & Cleaned"
-            if not clean_has:
-                status = "Dropped (Constant/Invalid)"
-            elif raw_nulls > 0 and clean_nulls == 0:
-                status = "Imputed / Cleaned (100% Fixed)"
-            elif raw_dt != clean_dt:
-                status = f"Type Converted ({raw_dt} ➔ {clean_dt})"
-
-            matrix_rows.append(
-                {
-                    "Column": col,
-                    "Raw Type": raw_dt,
-                    "Cleaned Type": clean_dt,
-                    "Raw Nulls": raw_nulls,
-                    "Cleaned Nulls": clean_nulls,
-                    "Transformation Status": status,
-                }
-            )
-
-        matrix_df = pd.DataFrame(matrix_rows)
-        st.dataframe(matrix_df, use_container_width=True)
-
-    # Download Cleaned CSV Button
-    st.markdown("---")
-    csv_bytes = cleaned_df.to_csv(index=False).encode("utf-8")
-    d1, d2 = st.columns([1, 1])
-    with d1:
         st.download_button(
-            label="📥 Download Cleaned CSV File",
-            data=csv_bytes,
+            "⬇️ Download cleaned CSV",
+            data=cleaned_df.to_csv(index=False).encode("utf-8"),
             file_name="cleaned_output.csv",
             mime="text/csv",
             type="primary",
-            use_container_width=True,
         )
-    with d2:
-        # Build comprehensive audit log markdown
-        audit_text = f"""# Multi-Agent Autonomous Data Cleaning Audit Report
+    elif status == "CLEAN":
+        st.info("The original data is unchanged because no cleaning was needed.")
 
-## Dataset Summary
-- **Original Dataset**: {raw_csv_path}
-- **Original Shape**: {raw_df.shape} ({raw_missing} missing values, {raw_duplicates} duplicates)
-- **Cleaned Shape**: {cleaned_df.shape} ({clean_missing} missing values, {clean_duplicates} duplicates)
 
-## Column Transformations
-{matrix_df.to_markdown(index=False)}
+def run_workflow(graph, initial_state: dict):
+    """Stream the graph so each agent's result appears the moment it finishes."""
+    final, events = dict(initial_state), []
+    live = st.container()
+    last = time.time()
+    with st.spinner("Agents are working..."):
+        for chunk in graph.stream(initial_state, config={"recursion_limit": 60}, stream_mode="updates"):
+            for node, update in chunk.items():
+                now = time.time()
+                final.update(update)
+                events.append((node, update, now - last))
+                last = now
+                with live:
+                    render_agent_event(node, update, events[-1][2])
+    return final, events
 
-## Final Validator Status
-{st.session_state.node_outputs.get('validation_agent', {}).get('validation_report', 'N/A')}
-"""
-        st.download_button(
-            label="📋 Download Full Audit Report (.md)",
-            data=audit_text,
-            file_name="cleaning_audit_report.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
+
+# ----------------------------------------------------------------------------
+# 8. MAIN APP
+# ----------------------------------------------------------------------------
+def main():
+    st.set_page_config(page_title="AI CSV Cleaner", page_icon="🧹", layout="wide")
+    st.title("🧹 AI CSV Cleaner")
+    st.write("Upload a CSV. AI agents will inspect, clean and validate it, and you can watch each step.")
+
+    with st.sidebar:
+        st.header("Settings")
+        api_key = st.text_input("Groq API key", type="password", help="Get one at console.groq.com")
+        model = st.selectbox("Model", MODEL_OPTIONS)
+        max_attempts = st.slider("Max cleaning attempts", 1, 5, 3)
+        st.caption("Generated cleaning scripts run on this machine. Use only data you trust.")
+        render_agent_roster()
+
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+    if uploaded is None:
+        st.info("Upload a CSV file to get started.")
+        st.stop()
+
+    try:
+        df, encoding = read_csv_safe(uploaded)
+    except ValueError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    # Forget old results when a different file is uploaded.
+    file_key = f"{uploaded.name}-{uploaded.size}"
+    if st.session_state.get("file_key") != file_key:
+        st.session_state.clear()
+        st.session_state["file_key"] = file_key
+
+    st.subheader(f"Your data: {uploaded.name}")
+    render_upload_overview(df)
+
+    if st.button("Clean dataset", type="primary", disabled=not api_key):
+        profile = profile_dataframe(df)
+        st.subheader("Agent activity (live)")
+        try:
+            graph = build_graph(make_llm(api_key, model))
+            # All working files live in a temp folder that is deleted afterwards.
+            with tempfile.TemporaryDirectory(prefix="csv_cleaner_") as tmp:
+                input_path = Path(tmp) / "input.csv"
+                input_path.write_bytes(uploaded.getvalue())
+                initial_state = {
+                    "input_path": str(input_path),
+                    "work_dir": tmp,
+                    "encoding": encoding,
+                    "max_attempts": max_attempts,
+                    "original_profile": profile,
+                    "original_stats": dataset_stats(df),
+                    "current_profile": profile,
+                    "history": [],
+                    "iteration": 0,
+                    "status": "START",
+                }
+                result, events = run_workflow(graph, initial_state)
+            st.session_state["result"], st.session_state["events"] = result, events
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Workflow failed: {type(exc).__name__}: {exc}")
+
+    if not api_key:
+        st.warning("Enter your Groq API key in the sidebar to enable cleaning.")
+
+    if "result" in st.session_state:
+        render_results(st.session_state["result"], st.session_state["events"])
+
+
+if __name__ == "__main__":
+    main()
